@@ -1,0 +1,9 @@
+# This public repository intentionally accepts only its build instructions.
+*
+!/.gitignore
+!/README.md
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/ios.yml

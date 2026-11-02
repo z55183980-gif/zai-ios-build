@@ -1,0 +1,257 @@
+name: Build and upload TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Full 40-character commit SHA from the private source"
+        required: true
+        type: string
+      upload_testflight:
+        description: "Upload to TestFlight after the tests pass"
+        required: true
+        default: false
+        type: boolean
+      ui_preview:
+        description: "UI check: archive and upload at once, without tests. Not a release candidate"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # A UI preview does not queue behind a full run.
+  group: ios-${{ inputs.ui_preview && 'preview' || 'full' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: appstore
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      IOS_PROJECT: ios/NativeZai.xcodeproj
+      IOS_SCHEME: Zai
+      IOS_BUNDLE_ID: com.ourzai.app
+    steps:
+      - name: Validate requested revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo '::error::A full 40-character commit SHA is required.'
+            exit 1
+          fi
+
+      - name: Fetch private native source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: z55183980-gif/zai-ios
+          ref: ${{ inputs.source_sha }}
+          path: private-source
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+          sparse-checkout: |
+            /ios/
+            /scripts/
+          sparse-checkout-cone-mode: false
+          show-progress: false
+
+      - name: Verify source and generate project
+        shell: bash
+        working-directory: private-source
+        run: |
+          if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-verify.log" 2>&1
+          test "$(git rev-parse HEAD)" = "$(printf '%s' "$SOURCE_SHA" | tr 'A-F' 'a-f')"
+          test -d "$(xcode-select -p)"
+          python3 scripts/generate-native-project.py
+          git diff --exit-code -- ios/NativeZai.xcodeproj ios/NativeZai/Info.plist
+          python3 scripts/check-native-project.py
+          PRIVATE
+          then
+            echo '::error::Private source validation failed; read the encrypted diagnostics.'
+            exit 1
+          fi
+
+      - name: Start booting the simulator
+        if: ${{ !inputs.ui_preview }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for v in d["devices"].values() for x in v if x["name"].startswith("iPhone")))')
+          echo "SIMULATOR_ID=$device_id" >> "$GITHUB_ENV"
+          nohup xcrun simctl boot "$device_id" > /dev/null 2>&1 &
+
+      - name: Compile application and tests
+        if: ${{ !inputs.ui_preview }}
+        shell: bash
+        working-directory: private-source
+        run: |
+          if ! xcodebuild -quiet build-for-testing -project "$IOS_PROJECT" -scheme "$IOS_SCHEME" \
+            -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -derivedDataPath "$RUNNER_TEMP/native-derived" \
+            ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            > "$RUNNER_TEMP/native-build.log" 2>&1; then
+            echo '::error::Native compilation failed; read the encrypted diagnostics.'
+            exit 1
+          fi
+
+      - name: Run native tests
+        if: ${{ !inputs.ui_preview }}
+        shell: bash
+        working-directory: private-source
+        run: |
+          if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-tests.log" 2>&1
+          xcrun simctl bootstatus "$SIMULATOR_ID" -b
+          xcodebuild test-without-building -project "$IOS_PROJECT" -scheme "$IOS_SCHEME" \
+            -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -parallel-testing-enabled NO -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
+            -derivedDataPath "$RUNNER_TEMP/native-derived" \
+            -resultBundlePath "$RUNNER_TEMP/native-tests.xcresult" \
+            ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+          PRIVATE
+          then
+            echo '::error::Native tests failed; read the encrypted diagnostics.'
+            exit 1
+          fi
+
+      - name: Install and validate signing material
+        if: ${{ inputs.upload_testflight || inputs.ui_preview }}
+        shell: bash
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+        run: |
+          if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-signing.log" 2>&1
+          umask 077
+          : "${BUILD_CERTIFICATE_BASE64:?Missing certificate}" "${P12_PASSWORD:?Missing certificate password}"
+          : "${BUILD_PROVISION_PROFILE_BASE64:?Missing profile}" "${KEYCHAIN_PASSWORD:?Missing keychain password}" "${IOS_TEAM_ID:?Missing team}"
+          keychain_path="$RUNNER_TEMP/native-signing.keychain-db"
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 -D > "$RUNNER_TEMP/native-certificate.p12"
+          printf '%s' "$BUILD_PROVISION_PROFILE_BASE64" | base64 -D > "$RUNNER_TEMP/native-profile.mobileprovision"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$RUNNER_TEMP/native-certificate.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security cms -D -i "$RUNNER_TEMP/native-profile.mobileprovision" > "$RUNNER_TEMP/native-profile.plist"
+          python3 - <<'PY'
+          import datetime, os, pathlib, plistlib, uuid
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          profile = plistlib.loads((temp / 'native-profile.plist').read_bytes())
+          team = os.environ['IOS_TEAM_ID']
+          assert team in profile['TeamIdentifier']
+          entitlement = profile['Entitlements']
+          assert entitlement['application-identifier'] == profile['ApplicationIdentifierPrefix'][0] + '.' + os.environ['IOS_BUNDLE_ID']
+          assert entitlement.get('aps-environment') == 'production'
+          assert not entitlement.get('get-task-allow', False)
+          assert 'ProvisionedDevices' not in profile and not profile.get('ProvisionsAllDevices')
+          assert profile['ExpirationDate'] > datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+          profile_id = profile['UUID']
+          uuid.UUID(profile_id)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('PROFILE_UUID=' + profile_id + '\n')
+          options = {'method': 'app-store-connect', 'signingStyle': 'manual', 'signingCertificate': 'Apple Distribution', 'teamID': team,
+                     'provisioningProfiles': {os.environ['IOS_BUNDLE_ID']: profile_id}, 'manageAppVersionAndBuildNumber': False, 'stripSwiftSymbols': True}
+          (temp / 'native-export.plist').write_bytes(plistlib.dumps(options))
+          for directory in ('Library/MobileDevice/Provisioning Profiles', 'Library/Developer/Xcode/UserData/Provisioning Profiles'):
+              destination = pathlib.Path.home() / directory
+              destination.mkdir(parents=True, exist_ok=True)
+              (destination / (profile_id + '.mobileprovision')).write_bytes((temp / 'native-profile.mobileprovision').read_bytes())
+          PY
+          PRIVATE
+          then
+            echo '::error::Signing setup failed; verify protected environment configuration.'
+            exit 1
+          fi
+
+      - name: Archive and export application
+        if: ${{ inputs.upload_testflight || inputs.ui_preview }}
+        shell: bash
+        working-directory: private-source
+        env:
+          IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+          IOS_MARKETING_VERSION: ${{ vars.IOS_MARKETING_VERSION || '1.0' }}
+        run: |
+          if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-archive.log" 2>&1
+          if (( GITHUB_RUN_NUMBER < 1 || GITHUB_RUN_NUMBER > 999800 || GITHUB_RUN_ATTEMPT < 1 || GITHUB_RUN_ATTEMPT > 99 )); then exit 1; fi
+          # Starts at 2.0.1, above the 1.x builds from the private repository's own runs.
+          printf -v build_number '%d.%d.%d' "$(((GITHUB_RUN_NUMBER - 1) / 100 + 2))" "$(((GITHUB_RUN_NUMBER - 1) % 100))" "$GITHUB_RUN_ATTEMPT"
+          xcodebuild -quiet archive -project "$IOS_PROJECT" -scheme "$IOS_SCHEME" \
+            -configuration Release -archivePath "$RUNNER_TEMP/native-archive.xcarchive" \
+            -destination 'generic/platform=iOS' DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$IOS_BUNDLE_ID" MARKETING_VERSION="$IOS_MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$build_number" CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY='Apple Distribution' PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" APS_ENVIRONMENT=production
+          xcodebuild -quiet -exportArchive -archivePath "$RUNNER_TEMP/native-archive.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/native-export.plist" -exportPath "$RUNNER_TEMP/native-export"
+          ipa_path=$(find "$RUNNER_TEMP/native-export" -maxdepth 1 -name '*.ipa' -print -quit)
+          test -n "$ipa_path"
+          echo "IPA_PATH=$ipa_path" >> "$GITHUB_ENV"
+          PRIVATE
+          then
+            echo '::error::Archive or export failed; read the encrypted diagnostics.'
+            exit 1
+          fi
+
+      - name: Upload to TestFlight
+        if: ${{ inputs.upload_testflight || inputs.ui_preview }}
+        uses: apple-actions/upload-testflight-build@665328adbecbc3ad929d3da710696d928b8a7ba9 # v5
+        with:
+          app-path: ${{ env.IPA_PATH }}
+          app-type: ios
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          wait-for-processing: 'true'
+
+      - name: Encrypt failed compilation diagnostics
+        if: failure()
+        shell: bash
+        env:
+          PUBLIC_CERT: ${{ vars.DIAGNOSTICS_PUBLIC_CERT }}
+        run: |
+          set -euo pipefail
+          test -n "$PUBLIC_CERT"
+          printf '%s\n' "$PUBLIC_CERT" > "$RUNNER_TEMP/diagnostics-cert.pem"
+          cd "$RUNNER_TEMP"
+          files=()
+          for name in native-verify.log native-build.log native-tests.log native-archive.log; do
+            if [ -f "$name" ]; then files+=("$name"); fi
+          done
+          tar -czf native-diagnostics.tar.gz "${files[@]}"
+          openssl smime -encrypt -binary -aes-256-cbc -in native-diagnostics.tar.gz \
+            -out native-diagnostics.enc -outform DER diagnostics-cert.pem
+          rm -f native-diagnostics.tar.gz diagnostics-cert.pem
+
+      - name: Save encrypted diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: encrypted-native-diagnostics
+          path: ${{ runner.temp }}/native-diagnostics.enc
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Remove private build material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          security delete-keychain "$RUNNER_TEMP/native-signing.keychain-db" >/dev/null 2>&1
+          if [[ "${PROFILE_UUID:-}" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi
+          rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/native-derived" "$RUNNER_TEMP/native-tests.xcresult" "$RUNNER_TEMP/native-archive.xcarchive" "$RUNNER_TEMP/native-export" "$HOME/private_keys"
+          rm -f "$RUNNER_TEMP"/native-*.log "$RUNNER_TEMP/native-certificate.p12" "$RUNNER_TEMP/native-profile.mobileprovision" "$RUNNER_TEMP/native-profile.plist" "$RUNNER_TEMP/native-export.plist"
+          exit 0
