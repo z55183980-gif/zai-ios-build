@@ -7,7 +7,3 @@
 !/.github/workflows/
 /.github/workflows/*
 !/.github/workflows/ios.yml
-!/.github/workflows/store-screenshots.yml
-!/.github/scripts/
-/.github/scripts/*
-!/.github/scripts/capture_store.py
